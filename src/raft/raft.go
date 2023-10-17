@@ -165,8 +165,6 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	// rf.heartsbeatsFlag = true
-	// fmt.Printf("节点%d收到节点%d的投票请求,节点任期为%d，候选者任期为%d，在%s\n", rf.me, args.CandidateId, rf.currentTerm, args.Term, time.Now())
 	if args.Term > rf.currentTerm {
 		reply.VoteGranted = true
 		rf.voteFor = args.CandidateId
@@ -177,7 +175,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.restartElectionTimerFlag = true
 		rf.electionTimeOut = false
 		rf.mu.Unlock()
-		// fmt.Printf("节点%d投票给节点%d\n", rf.me, args.CandidateId)
 	} else {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
@@ -203,7 +200,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.state = follower
 		rf.currentTerm = args.Term
 		rf.mu.Unlock()
-		// fmt.Printf("节点%d收到%d的心跳，leader任期为%d，节点任期为%d\n", rf.me, args.LeaderId, args.Term, rf.currentTerm)
 	}
 }
 
@@ -258,7 +254,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
+	if rf.state == leader {
+		isLeader = true
+	}
 
 	// Your code here (2B).
 
@@ -291,9 +290,8 @@ func (rf *Raft) ticker() {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
-		// time.Sleep().
+		// time.Sleep()
 		if rf.state == leader {
-			// fmt.Printf("领导者%d开始发送心跳，任期为%d\n", rf.me, rf.currentTerm)
 			rf.Heartsbeats()
 			rf.HeartsbeatsTimer()
 		}
@@ -305,9 +303,8 @@ func (rf *Raft) ticker() {
 				rf.electionTimeOut = false
 				rf.mu.Lock()
 				rf.state = candidate
-				rf.mu.Unlock()
 				rf.currentTerm = rf.currentTerm + 1
-				// fmt.Printf("节点%d变成候选者，任期为%d，在%s\n", rf.me, rf.currentTerm, time.Now())
+				rf.mu.Unlock()
 			}
 		}
 		if rf.state == candidate {
@@ -324,23 +321,19 @@ func (rf *Raft) ticker() {
 
 	}
 }
-
 func (rf *Raft) ElectionTimer() {
 	rand.Seed(time.Now().UnixNano() * int64(rf.me))
 	s := rand.Intn(150) + 150
-	// fmt.Printf("随机数为%d\n", s)
 	for i := 0; i < s; i++ {
 		time.Sleep(time.Millisecond)
 		if rf.restartElectionTimerFlag {
 			rf.mu.Lock()
-			// fmt.Printf("节点%d时钟重启,i = %d\n", rf.me, i)
 			rf.restartElectionTimerFlag = false
 			rf.mu.Unlock()
 			i = 0
 			s = rand.Intn(150) + 150
 		}
 	}
-	// fmt.Printf("节点%d的时钟在%s超时\n", rf.me, time.Now())
 	rf.electionTimeOut = true
 }
 func (rf *Raft) HeartsbeatsTimer() {
@@ -360,7 +353,6 @@ func (rf *Raft) Heartsbeats() {
 	}
 }
 func (rf *Raft) Election() {
-	// fmt.Printf("节点%d开始选举,在%s\n", rf.me, time.Now())
 	reqArgs := make([]RequestVoteArgs, 0)
 	reqReply := make([]RequestVoteReply, 0)
 	voteNum := 1
@@ -380,7 +372,6 @@ func (rf *Raft) Election() {
 					rf.mu.Lock()
 					voteNum++
 					if voteNum >= (rf.severNum/2 + 1) {
-						// fmt.Printf("节点%d成为领导者\n", rf.me)
 						rf.state = leader
 					}
 					rf.mu.Unlock()
