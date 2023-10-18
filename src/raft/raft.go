@@ -55,6 +55,10 @@ type ApplyMsg struct {
 	SnapshotTerm  int
 	SnapshotIndex int
 }
+type Entry struct {
+	Command interface{}
+	Item    int
+}
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -71,6 +75,10 @@ type Raft struct {
 	voteFor                  int
 	electionTimeOut          bool
 	restartElectionTimerFlag bool
+	commitIndex              int
+	nextIndex                []int
+	matchIndex               []int
+	log                      []Entry
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -182,24 +190,59 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
-	// PrevLogIndex int
-	// PrevLogItem  int
-	// leaderCommit int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogItem  int
+	LeaderCommit int
+	Entries      []Entry
 }
 
 type AppendEntriesReply struct {
-	Term int
+	Term    int
+	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if args.LeaderId != rf.me && args.Term >= rf.currentTerm {
+	if args.Term >= rf.currentTerm {
 		rf.mu.Lock()
 		rf.restartElectionTimerFlag = true
 		rf.state = follower
 		rf.currentTerm = args.Term
 		rf.mu.Unlock()
+		if rf.lastLogIndex < args.PrevLogIndex {
+			reply.Success = false
+			reply.Term = rf.currentTerm
+			return
+		}
+		if rf.log[args.PrevLogIndex].Item != args.PrevLogItem {
+			rf.lastLogIndex = args.PrevLogIndex - 1
+			rf.lastLogItem = rf.log[args.PrevLogIndex-1].Item
+			reply.Success = false
+			reply.Term = rf.currentTerm
+			return
+		}
+		for i := 0; i < len(args.Entries); i++ {
+			if rf.lastLogIndex == (len(rf.log) - 1) {
+				rf.log = append(rf.log, args.Entries[i])
+				rf.lastLogIndex++
+				rf.lastLogItem = args.Entries[i].Item
+			} else {
+				rf.lastLogIndex++
+				rf.lastLogItem = args.Entries[i].Item
+				rf.log[rf.lastLogIndex] = args.Entries[i]
+			}
+		}
+		if args.LeaderCommit > rf.commitIndex {
+			if args.LeaderCommit > rf.lastLogIndex {
+				rf.commitIndex = rf.lastLogIndex
+			} else {
+				rf.commitIndex = args.LeaderCommit
+			}
+		}
+	} else {
+		reply.Success = false
+		reply.Term = rf.currentTerm
 	}
 }
 
@@ -388,6 +431,9 @@ func (rf *Raft) Election() {
 			return
 		}
 	}
+}
+func (rf *Raft) LeaderInit() {
+
 }
 
 // the service or tester wants to create a Raft server. the ports
