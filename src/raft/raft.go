@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -67,6 +68,7 @@ type Raft struct {
 	persister                *Persister          // Object to hold this peer's persisted state
 	me                       int                 // this peer's index into peers[]
 	dead                     int32               // set by Kill()
+	applyMsg                 chan ApplyMsg
 	state                    int
 	currentTerm              int
 	lastLogIndex             int
@@ -210,35 +212,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.state = follower
 		rf.currentTerm = args.Term
 		rf.mu.Unlock()
-		if rf.lastLogIndex < args.PrevLogIndex {
-			reply.Success = false
-			reply.Term = rf.currentTerm
-			return
-		}
-		if rf.log[args.PrevLogIndex].Item != args.PrevLogItem {
-			rf.lastLogIndex = args.PrevLogIndex - 1
-			rf.lastLogItem = rf.log[args.PrevLogIndex-1].Item
-			reply.Success = false
-			reply.Term = rf.currentTerm
-			return
-		}
-		for i := 0; i < len(args.Entries); i++ {
-			if rf.lastLogIndex == (len(rf.log) - 1) {
-				rf.log = append(rf.log, args.Entries[i])
-				rf.lastLogIndex++
-				rf.lastLogItem = args.Entries[i].Item
-			} else {
-				rf.lastLogIndex++
-				rf.lastLogItem = args.Entries[i].Item
-				rf.log[rf.lastLogIndex] = args.Entries[i]
-			}
-		}
 		if args.LeaderCommit > rf.commitIndex {
 			if args.LeaderCommit > rf.lastLogIndex {
 				rf.commitIndex = rf.lastLogIndex
 			} else {
 				rf.commitIndex = args.LeaderCommit
 			}
+		}
+		if len(args.Entries) > 0 {
+			if rf.lastLogIndex < args.PrevLogIndex {
+				reply.Success = false
+				reply.Term = rf.currentTerm
+				return
+			}
+			if rf.log[args.PrevLogIndex].Item != args.PrevLogItem {
+				rf.lastLogIndex = args.PrevLogIndex - 1
+				rf.lastLogItem = rf.log[args.PrevLogIndex-1].Item
+				reply.Success = false
+				reply.Term = rf.currentTerm
+				return
+			}
+			for i := 0; i < len(args.Entries); i++ {
+				if rf.lastLogIndex == (len(rf.log) - 1) {
+					rf.log = append(rf.log, args.Entries[i])
+					rf.lastLogIndex++
+					rf.lastLogItem = args.Entries[i].Item
+				} else {
+					rf.lastLogIndex++
+					rf.lastLogItem = args.Entries[i].Item
+					rf.log[rf.lastLogIndex] = args.Entries[i]
+				}
+				rf.applyMsg <- ApplyMsg{
+					CommandValid:  true,
+					Command:       args.Entries[i].Command,
+					CommandIndex:  rf.lastLogIndex,
+					SnapshotValid: false,
+					Snapshot:      []byte{},
+					SnapshotTerm:  0,
+					SnapshotIndex: 0,
+				}
+			}
+			reply.Success = true
+			reply.Term = rf.currentTerm
+			fmt.Printf("节点%d成功复制日志%d\n", rf.me, rf.lastLogIndex)
+			return
 		}
 	} else {
 		reply.Success = false
@@ -295,16 +312,81 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
+	index := rf.lastLogIndex + 1
+	term := rf.currentTerm
 	isLeader := false
 	if rf.state == leader {
 		isLeader = true
+	} else {
+		return index, term, isLeader
 	}
 
 	// Your code here (2B).
 
-	return index, term, isLeader
+	entries := []Entry{}
+	entries = append(entries, Entry{Command: command, Item: rf.currentTerm})
+	rf.lastLogIndex += 1
+	rf.lastLogItem = rf.currentTerm
+	rf.log = append(rf.log, entries[0])
+	rf.applyMsg <- ApplyMsg{
+		CommandValid:  true,
+		Command:       command,
+		CommandIndex:  rf.lastLogIndex,
+		SnapshotValid: false,
+		Snapshot:      []byte{},
+		SnapshotTerm:  0,
+		SnapshotIndex: 0,
+	}
+	AppendLogArgs := make([]AppendEntriesArgs, 0)
+	AppendLogReply := make([]AppendEntriesReply, 0)
+	count := 1
+	for i := 0; i < rf.severNum; i++ {
+		AppendLogArgs = append(AppendLogArgs, AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: rf.lastLogIndex - 1,
+			PrevLogItem:  rf.log[rf.lastLogIndex-1].Item,
+			LeaderCommit: rf.commitIndex,
+			Entries:      entries})
+		AppendLogReply = append(AppendLogReply, AppendEntriesReply{})
+		if i != rf.me {
+			go func(i int) {
+				for {
+					if (rf.nextIndex[i] - 1) == -1 {
+						fmt.Printf("节点%d出现错误", rf.me)
+					}
+					AppendLogArgs[i].Entries[0] = rf.log[rf.nextIndex[i]]
+					AppendLogArgs[i].PrevLogIndex = rf.nextIndex[i] - 1
+					AppendLogArgs[i].PrevLogItem = rf.log[rf.nextIndex[i]-1].Item
+					ok := rf.sendAppendEntries(i, &AppendLogArgs[i], &AppendLogReply[i])
+					if ok {
+						if AppendLogReply[i].Success {
+							rf.matchIndex[i] = rf.nextIndex[i]
+							rf.nextIndex[i] = rf.nextIndex[i] + 1
+							if rf.nextIndex[i] == rf.lastLogIndex+1 {
+								rf.mu.Lock()
+								count++
+								rf.mu.Unlock()
+								return
+							}
+						} else {
+							rf.nextIndex[i]--
+						}
+					} else {
+						return
+					}
+				}
+			}(i)
+		}
+	}
+	for {
+		if count >= (rf.severNum/2 + 1) {
+			rf.commitIndex = rf.lastLogIndex
+			fmt.Printf("日志%d已经提交\n", rf.lastLogIndex)
+			return index, term, isLeader
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -329,7 +411,7 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
@@ -392,6 +474,11 @@ func (rf *Raft) Heartsbeats() {
 			go func(i int) {
 				rf.sendAppendEntries(i, &heatsbeatssArgs[i], &heartsbeatsReply[i])
 			}(i)
+			if heartsbeatsReply[i].Term > rf.currentTerm {
+				rf.mu.Lock()
+				rf.state = follower
+				rf.mu.Unlock()
+			}
 		}
 	}
 }
@@ -428,12 +515,19 @@ func (rf *Raft) Election() {
 			return
 		}
 		if rf.state != candidate {
+			if rf.state == leader {
+				rf.LeaderInit()
+			}
 			return
 		}
 	}
 }
 func (rf *Raft) LeaderInit() {
-
+	for i := 0; i < rf.severNum; i++ {
+		rf.nextIndex = append(rf.nextIndex, rf.lastLogIndex+1)
+		rf.matchIndex = append(rf.matchIndex, 0)
+	}
+	fmt.Printf("节点%d成为领导者节点\n", rf.me)
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -450,6 +544,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
+	rf.applyMsg = applyCh
 	rf.me = me
 	rf.currentTerm = 0
 	rf.state = follower
@@ -457,7 +552,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteFor = -1
 	rf.electionTimeOut = false
 	rf.restartElectionTimerFlag = false
-
+	rf.commitIndex = 0
+	rf.lastLogIndex = 0
+	rf.lastLogItem = 1
+	rf.log = make([]Entry, 0)
+	rf.log = append(rf.log, Entry{
+		Command: nil,
+		Item:    1,
+	})
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
