@@ -59,6 +59,7 @@ type ApplyMsg struct {
 type Entry struct {
 	Command interface{}
 	Item    int
+	Index   int
 }
 
 // A Go object implementing a single Raft peer.
@@ -80,6 +81,7 @@ type Raft struct {
 	commitIndex              int
 	nextIndex                []int
 	matchIndex               []int
+	isConnected              []bool
 	log                      []Entry
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -176,18 +178,29 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	if args.Term > rf.currentTerm {
-		reply.VoteGranted = true
-		rf.voteFor = args.CandidateId
-		rf.currentTerm = args.Term
-		reply.Term = rf.currentTerm
 		rf.mu.Lock()
 		rf.state = follower
 		rf.restartElectionTimerFlag = true
 		rf.electionTimeOut = false
+		rf.currentTerm = args.Term
+		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
+		if args.LastLogItem < rf.lastLogItem {
+			reply.VoteGranted = false
+			reply.Term = rf.currentTerm
+			return
+		}
+		if args.LastLogItem == rf.lastLogItem && args.LastLogIndex < rf.lastLogIndex {
+			reply.VoteGranted = false
+			reply.Term = rf.currentTerm
+			return
+		}
+		reply.VoteGranted = true
+		rf.voteFor = args.CandidateId
 	} else {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		return
 	}
 }
 
@@ -197,7 +210,7 @@ type AppendEntriesArgs struct {
 	PrevLogIndex int
 	PrevLogItem  int
 	LeaderCommit int
-	Entries      []Entry
+	Entries      Entry
 }
 
 type AppendEntriesReply struct {
@@ -212,51 +225,46 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.state = follower
 		rf.currentTerm = args.Term
 		rf.mu.Unlock()
-		if args.LeaderCommit > rf.commitIndex {
-			if args.LeaderCommit > rf.lastLogIndex {
-				rf.commitIndex = rf.lastLogIndex
+		if rf.lastLogIndex < args.PrevLogIndex {
+			reply.Success = false
+			reply.Term = rf.currentTerm
+			return
+		}
+		if rf.log[args.PrevLogIndex].Item != args.PrevLogItem {
+			rf.lastLogIndex = args.PrevLogIndex - 1
+			rf.lastLogItem = rf.log[args.PrevLogIndex-1].Item
+			reply.Success = false
+			reply.Term = rf.currentTerm
+			return
+		}
+		if args.Entries.Command != nil {
+			rf.lastLogIndex = args.Entries.Index
+			rf.lastLogItem = args.Entries.Item
+			if rf.lastLogIndex == len(rf.log) {
+				rf.log = append(rf.log, args.Entries)
 			} else {
-				rf.commitIndex = args.LeaderCommit
+				rf.log[rf.lastLogIndex] = args.Entries
 			}
 		}
-		if len(args.Entries) > 0 {
-			if rf.lastLogIndex < args.PrevLogIndex {
-				reply.Success = false
-				reply.Term = rf.currentTerm
-				return
-			}
-			if rf.log[args.PrevLogIndex].Item != args.PrevLogItem {
-				rf.lastLogIndex = args.PrevLogIndex - 1
-				rf.lastLogItem = rf.log[args.PrevLogIndex-1].Item
-				reply.Success = false
-				reply.Term = rf.currentTerm
-				return
-			}
-			for i := 0; i < len(args.Entries); i++ {
-				if rf.lastLogIndex == (len(rf.log) - 1) {
-					rf.log = append(rf.log, args.Entries[i])
-					rf.lastLogIndex++
-					rf.lastLogItem = args.Entries[i].Item
-				} else {
-					rf.lastLogIndex++
-					rf.lastLogItem = args.Entries[i].Item
-					rf.log[rf.lastLogIndex] = args.Entries[i]
-				}
+		if args.LeaderCommit > rf.commitIndex {
+			for rf.commitIndex < rf.lastLogIndex && rf.commitIndex < args.LeaderCommit {
+				rf.commitIndex++
 				rf.applyMsg <- ApplyMsg{
 					CommandValid:  true,
-					Command:       args.Entries[i].Command,
-					CommandIndex:  rf.lastLogIndex,
+					Command:       rf.log[rf.commitIndex].Command,
+					CommandIndex:  rf.commitIndex,
 					SnapshotValid: false,
 					Snapshot:      []byte{},
 					SnapshotTerm:  0,
 					SnapshotIndex: 0,
 				}
 			}
-			reply.Success = true
-			reply.Term = rf.currentTerm
-			fmt.Printf("节点%d成功复制日志%d\n", rf.me, rf.lastLogIndex)
-			return
 		}
+		reply.Success = true
+		reply.Term = rf.currentTerm
+		// fmt.Printf("节点%d成功复制日志%d,日志内容是%d\n", rf.me, rf.lastLogIndex, args.Entries.Command)
+		return
+
 	} else {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -320,44 +328,54 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	} else {
 		return index, term, isLeader
 	}
-
 	// Your code here (2B).
-
-	entries := []Entry{}
-	entries = append(entries, Entry{Command: command, Item: rf.currentTerm})
+	rf.mu.Lock()
 	rf.lastLogIndex += 1
 	rf.lastLogItem = rf.currentTerm
-	rf.log = append(rf.log, entries[0])
-	rf.applyMsg <- ApplyMsg{
-		CommandValid:  true,
-		Command:       command,
-		CommandIndex:  rf.lastLogIndex,
-		SnapshotValid: false,
-		Snapshot:      []byte{},
-		SnapshotTerm:  0,
-		SnapshotIndex: 0,
+	entries := Entry{
+		Command: command,
+		Item:    rf.currentTerm,
+		Index:   rf.lastLogIndex,
 	}
-	AppendLogArgs := make([]AppendEntriesArgs, 0)
-	AppendLogReply := make([]AppendEntriesReply, 0)
-	count := 1
+	rf.log = append(rf.log, entries)
+	index = entries.Index
+	term = entries.Item
+	rf.mu.Unlock()
+	time.Sleep(10 * time.Millisecond)
+	isConnectCount := 0
 	for i := 0; i < rf.severNum; i++ {
-		AppendLogArgs = append(AppendLogArgs, AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: rf.lastLogIndex - 1,
-			PrevLogItem:  rf.log[rf.lastLogIndex-1].Item,
-			LeaderCommit: rf.commitIndex,
-			Entries:      entries})
-		AppendLogReply = append(AppendLogReply, AppendEntriesReply{})
+		if rf.isConnected[i] {
+			isConnectCount++
+		}
+	}
+	if isConnectCount < rf.severNum/2+1 {
+		return index, term, isLeader
+	}
+	if entries.Index < rf.lastLogIndex {
+		return index, term, isLeader
+	}
+	if rf.state != leader {
+		isLeader = false
+		return index, term, isLeader
+	}
+	AppendLogArgs := make([]AppendEntriesArgs, rf.severNum)
+	AppendLogReply := make([]AppendEntriesReply, rf.severNum)
+	count := 1
+	GRCount := 1
+	for i := 0; i < rf.severNum; i++ {
 		if i != rf.me {
 			go func(i int) {
+				defer func() {
+					GRCount++
+				}()
 				for {
-					if (rf.nextIndex[i] - 1) == -1 {
-						fmt.Printf("节点%d出现错误", rf.me)
-					}
-					AppendLogArgs[i].Entries[0] = rf.log[rf.nextIndex[i]]
+					AppendLogArgs[i].LeaderId = rf.me
+					AppendLogArgs[i].LeaderCommit = rf.commitIndex
+					AppendLogArgs[i].Term = rf.currentTerm
+					AppendLogArgs[i].Entries = rf.log[rf.nextIndex[i]]
 					AppendLogArgs[i].PrevLogIndex = rf.nextIndex[i] - 1
 					AppendLogArgs[i].PrevLogItem = rf.log[rf.nextIndex[i]-1].Item
+					// fmt.Printf("节点%d向节点%d复制日志，日志内容为%d\n", rf.me, i, AppendLogArgs[i].Entries.Command)
 					ok := rf.sendAppendEntries(i, &AppendLogArgs[i], &AppendLogReply[i])
 					if ok {
 						if AppendLogReply[i].Success {
@@ -370,6 +388,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 								return
 							}
 						} else {
+							if AppendLogReply[i].Term > rf.currentTerm {
+								rf.mu.Lock()
+								rf.state = follower
+								rf.currentTerm = AppendLogReply[i].Term
+								rf.mu.Unlock()
+								return
+							}
 							rf.nextIndex[i]--
 						}
 					} else {
@@ -381,11 +406,25 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	for {
 		if count >= (rf.severNum/2 + 1) {
-			rf.commitIndex = rf.lastLogIndex
-			fmt.Printf("日志%d已经提交\n", rf.lastLogIndex)
+			for rf.commitIndex < rf.lastLogIndex {
+				rf.commitIndex++
+				rf.applyMsg <- ApplyMsg{
+					CommandValid:  true,
+					Command:       rf.log[rf.commitIndex].Command,
+					CommandIndex:  rf.commitIndex,
+					SnapshotValid: false,
+					Snapshot:      []byte{},
+					SnapshotTerm:  0,
+					SnapshotIndex: 0,
+				}
+				// fmt.Printf("日志%d已经提交\n", rf.commitIndex)
+			}
 			return index, term, isLeader
 		}
-		time.Sleep(time.Millisecond)
+		if GRCount == rf.severNum {
+			return index, term, isLeader
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -462,27 +501,42 @@ func (rf *Raft) ElectionTimer() {
 	rf.electionTimeOut = true
 }
 func (rf *Raft) HeartsbeatsTimer() {
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 }
 func (rf *Raft) Heartsbeats() {
-	heatsbeatssArgs := make([]AppendEntriesArgs, 0)
-	heartsbeatsReply := make([]AppendEntriesReply, 0)
+	heatsbeatssArgs := make([]AppendEntriesArgs, rf.severNum)
+	heartsbeatsReply := make([]AppendEntriesReply, rf.severNum)
 	for i := 0; i < rf.severNum; i++ {
-		heatsbeatssArgs = append(heatsbeatssArgs, AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me})
-		heartsbeatsReply = append(heartsbeatsReply, AppendEntriesReply{})
+		heatsbeatssArgs[i] = AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: rf.lastLogIndex,
+			PrevLogItem:  rf.lastLogItem,
+			LeaderCommit: rf.commitIndex,
+			Entries: Entry{
+				Command: nil,
+				Item:    0,
+			}}
 		if i != rf.me {
 			go func(i int) {
-				rf.sendAppendEntries(i, &heatsbeatssArgs[i], &heartsbeatsReply[i])
+				ok := rf.sendAppendEntries(i, &heatsbeatssArgs[i], &heartsbeatsReply[i])
+				if ok {
+					if heartsbeatsReply[i].Term > rf.currentTerm {
+						rf.mu.Lock()
+						rf.state = follower
+						rf.currentTerm = heartsbeatsReply[i].Term
+						rf.mu.Unlock()
+					}
+					rf.isConnected[i] = true
+				} else {
+					rf.isConnected[i] = false
+				}
 			}(i)
-			if heartsbeatsReply[i].Term > rf.currentTerm {
-				rf.mu.Lock()
-				rf.state = follower
-				rf.mu.Unlock()
-			}
 		}
 	}
 }
 func (rf *Raft) Election() {
+	// fmt.Printf("节点%d开始选举\n", rf.me)
 	reqArgs := make([]RequestVoteArgs, 0)
 	reqReply := make([]RequestVoteReply, 0)
 	voteNum := 1
@@ -526,6 +580,7 @@ func (rf *Raft) LeaderInit() {
 	for i := 0; i < rf.severNum; i++ {
 		rf.nextIndex = append(rf.nextIndex, rf.lastLogIndex+1)
 		rf.matchIndex = append(rf.matchIndex, 0)
+		rf.isConnected[i] = true
 	}
 	fmt.Printf("节点%d成为领导者节点\n", rf.me)
 }
@@ -554,12 +609,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.restartElectionTimerFlag = false
 	rf.commitIndex = 0
 	rf.lastLogIndex = 0
-	rf.lastLogItem = 1
+	rf.lastLogItem = 0
 	rf.log = make([]Entry, 0)
 	rf.log = append(rf.log, Entry{
 		Command: nil,
-		Item:    1,
+		Item:    0,
 	})
+	rf.isConnected = make([]bool, rf.severNum)
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
