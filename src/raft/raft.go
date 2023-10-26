@@ -18,7 +18,7 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 
 	"fmt"
 	"math/rand"
@@ -26,7 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -83,6 +83,7 @@ type Raft struct {
 	matchIndex               []int
 	isConnected              []bool
 	log                      []Entry
+	isAppending              bool
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -110,12 +111,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -125,17 +127,20 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var voteFor int
+	var currentTerm int
+	var log []Entry
+	if d.Decode(&voteFor) != nil ||
+		d.Decode(&currentTerm) != nil ||
+		d.Decode(&log) != nil {
+
+	} else {
+		rf.voteFor = voteFor
+		rf.currentTerm = currentTerm
+		rf.log = log
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -176,6 +181,9 @@ type RequestVoteReply struct {
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	defer func() {
+		rf.persist()
+	}()
 	// Your code here (2A, 2B).
 	if args.Term > rf.currentTerm {
 		rf.mu.Lock()
@@ -219,6 +227,9 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	defer func() {
+		rf.persist()
+	}()
 	if args.Term >= rf.currentTerm {
 		rf.mu.Lock()
 		rf.restartElectionTimerFlag = true
@@ -264,10 +275,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		// fmt.Printf("节点%d成功复制日志%d,日志内容是%d\n", rf.me, rf.lastLogIndex, args.Entries.Command)
 		return
-
 	} else {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		return
 	}
 }
 
@@ -299,10 +310,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	rf.persist()
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	rf.persist()
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -320,6 +333,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	defer func() {
+		rf.mu.Lock()
+		rf.isAppending = false
+		rf.mu.Unlock()
+	}()
 	index := rf.lastLogIndex + 1
 	term := rf.currentTerm
 	isLeader := false
@@ -330,6 +348,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	// Your code here (2B).
 	rf.mu.Lock()
+	rf.isAppending = true
 	rf.lastLogIndex += 1
 	rf.lastLogItem = rf.currentTerm
 	entries := Entry{
@@ -526,10 +545,33 @@ func (rf *Raft) Heartsbeats() {
 						rf.state = follower
 						rf.currentTerm = heartsbeatsReply[i].Term
 						rf.mu.Unlock()
+						return
 					}
 					rf.isConnected[i] = true
 				} else {
 					rf.isConnected[i] = false
+				}
+				if rf.nextIndex[i] <= rf.lastLogIndex && rf.isConnected[i] && !rf.isAppending && rf.state == leader {
+					for {
+						heatsbeatssArgs[i].PrevLogIndex = rf.nextIndex[i] - 1
+						heatsbeatssArgs[i].PrevLogItem = rf.log[rf.nextIndex[i]-1].Item
+						heatsbeatssArgs[i].Entries = rf.log[rf.nextIndex[i]]
+						ok := rf.sendAppendEntries(i, &heatsbeatssArgs[i], &heartsbeatsReply[i])
+						if ok {
+							if heartsbeatsReply[i].Success {
+								rf.matchIndex[i] = rf.nextIndex[i]
+								rf.nextIndex[i] += 1
+								if (rf.nextIndex[i] - 1) == rf.lastLogIndex {
+									return
+								}
+							} else {
+								rf.nextIndex[i]--
+							}
+							rf.isConnected[i] = true
+						} else {
+							rf.isConnected[i] = false
+						}
+					}
 				}
 			}(i)
 		}
@@ -607,19 +649,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteFor = -1
 	rf.electionTimeOut = false
 	rf.restartElectionTimerFlag = false
-	rf.commitIndex = 0
-	rf.lastLogIndex = 0
-	rf.lastLogItem = 0
 	rf.log = make([]Entry, 0)
 	rf.log = append(rf.log, Entry{
 		Command: nil,
 		Item:    0,
 	})
+	rf.commitIndex = 0
+	rf.lastLogIndex = 0
+	rf.lastLogItem = 0
 	rf.isConnected = make([]bool, rf.severNum)
+	rf.isAppending = false
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.lastLogIndex = len(rf.log) - 1
+	rf.lastLogItem = rf.log[rf.lastLogIndex].Item
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

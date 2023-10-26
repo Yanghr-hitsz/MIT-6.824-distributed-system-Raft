@@ -689,7 +689,6 @@ func TestPersist12C(t *testing.T) {
 		cfg.disconnect(i)
 		cfg.connect(i)
 	}
-
 	cfg.one(12, servers, true)
 
 	leader1 := cfg.checkOneLeader()
