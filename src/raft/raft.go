@@ -83,7 +83,9 @@ type Raft struct {
 	matchIndex               []int
 	isConnected              []bool
 	log                      []Entry
-	isAppending              bool
+	isAppending              int
+	AppendLock               []bool
+	MissLogConut             []int
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -218,7 +220,7 @@ type AppendEntriesArgs struct {
 	PrevLogIndex int
 	PrevLogItem  int
 	LeaderCommit int
-	Entries      Entry
+	Entries      []Entry
 }
 
 type AppendEntriesReply struct {
@@ -230,56 +232,56 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer func() {
 		rf.persist()
 	}()
-	if args.Term >= rf.currentTerm {
-		rf.mu.Lock()
-		rf.restartElectionTimerFlag = true
-		rf.state = follower
-		rf.currentTerm = args.Term
-		rf.mu.Unlock()
-		if rf.lastLogIndex < args.PrevLogIndex {
-			reply.Success = false
-			reply.Term = rf.currentTerm
-			return
-		}
-		if rf.log[args.PrevLogIndex].Item != args.PrevLogItem {
-			rf.lastLogIndex = args.PrevLogIndex - 1
-			rf.lastLogItem = rf.log[args.PrevLogIndex-1].Item
-			reply.Success = false
-			reply.Term = rf.currentTerm
-			return
-		}
-		if args.Entries.Command != nil {
-			rf.lastLogIndex = args.Entries.Index
-			rf.lastLogItem = args.Entries.Item
-			if rf.lastLogIndex == len(rf.log) {
-				rf.log = append(rf.log, args.Entries)
-			} else {
-				rf.log[rf.lastLogIndex] = args.Entries
-			}
-		}
-		if args.LeaderCommit > rf.commitIndex {
-			for rf.commitIndex < rf.lastLogIndex && rf.commitIndex < args.LeaderCommit {
-				rf.commitIndex++
-				rf.applyMsg <- ApplyMsg{
-					CommandValid:  true,
-					Command:       rf.log[rf.commitIndex].Command,
-					CommandIndex:  rf.commitIndex,
-					SnapshotValid: false,
-					Snapshot:      []byte{},
-					SnapshotTerm:  0,
-					SnapshotIndex: 0,
-				}
-			}
-		}
-		reply.Success = true
-		reply.Term = rf.currentTerm
-		// fmt.Printf("节点%d成功复制日志%d,日志内容是%d\n", rf.me, rf.lastLogIndex, args.Entries.Command)
-		return
-	} else {
+	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
+	rf.mu.Lock()
+	rf.restartElectionTimerFlag = true
+	rf.state = follower
+	rf.currentTerm = args.Term
+	rf.mu.Unlock()
+	if rf.lastLogIndex < args.PrevLogIndex {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+	if rf.log[args.PrevLogIndex].Item != args.PrevLogItem {
+		rf.lastLogIndex = args.PrevLogIndex - 1
+		rf.lastLogItem = rf.log[args.PrevLogIndex-1].Item
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+	for i := 0; i < len(args.Entries); i++ {
+		rf.lastLogIndex = args.Entries[i].Index
+		rf.lastLogItem = args.Entries[i].Item
+		if rf.lastLogIndex == len(rf.log) {
+			rf.log = append(rf.log, args.Entries[i])
+		} else {
+			rf.log[rf.lastLogIndex] = args.Entries[i]
+		}
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		for rf.commitIndex < rf.lastLogIndex && rf.commitIndex < args.LeaderCommit {
+			rf.commitIndex++
+			rf.applyMsg <- ApplyMsg{
+				CommandValid:  true,
+				Command:       rf.log[rf.commitIndex].Command,
+				CommandIndex:  rf.commitIndex,
+				SnapshotValid: false,
+				Snapshot:      []byte{},
+				SnapshotTerm:  0,
+				SnapshotIndex: 0,
+			}
+		}
+	}
+	reply.Success = true
+	reply.Term = rf.currentTerm
+	// fmt.Printf("节点%d成功复制日志%d,日志内容是%d\n", rf.me, rf.lastLogIndex, args.Entries.Command)
+	return
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -333,73 +335,104 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+
 	defer func() {
-		rf.mu.Lock()
-		rf.isAppending = false
-		rf.mu.Unlock()
+		rf.isAppending--
 	}()
+
 	index := rf.lastLogIndex + 1
 	term := rf.currentTerm
 	isLeader := false
 	if rf.state == leader {
 		isLeader = true
 	} else {
+		rf.isAppending++
 		return index, term, isLeader
 	}
 	// Your code here (2B).
+
+	// for rf.AppendLock {
+	// 	time.Sleep(1 * time.Millisecond)
+	// }
+
 	rf.mu.Lock()
-	rf.isAppending = true
+	rf.isAppending++
 	rf.lastLogIndex += 1
 	rf.lastLogItem = rf.currentTerm
-	entries := Entry{
+	entry := Entry{
 		Command: command,
 		Item:    rf.currentTerm,
 		Index:   rf.lastLogIndex,
 	}
-	rf.log = append(rf.log, entries)
-	index = entries.Index
-	term = entries.Item
+	rf.log = append(rf.log, entry)
+	index = entry.Index
+	term = entry.Item
 	rf.mu.Unlock()
-	time.Sleep(10 * time.Millisecond)
-	isConnectCount := 0
-	for i := 0; i < rf.severNum; i++ {
-		if rf.isConnected[i] {
-			isConnectCount++
-		}
-	}
-	if isConnectCount < rf.severNum/2+1 {
-		return index, term, isLeader
-	}
-	if entries.Index < rf.lastLogIndex {
+
+	time.Sleep(5 * time.Millisecond)
+
+	if entry.Index < rf.lastLogIndex {
 		return index, term, isLeader
 	}
 	if rf.state != leader {
 		isLeader = false
 		return index, term, isLeader
 	}
+	ConnectConut := 0
+	for i := 0; i < rf.severNum; i++ {
+		if rf.isConnected[i] {
+			ConnectConut++
+		}
+	}
+	if ConnectConut < (rf.severNum/2 + 1) {
+		return index, term, isLeader
+	}
+
+	// rf.mu.Lock()
+	// rf.AppendLock = true
+	// rf.mu.Unlock()
 	AppendLogArgs := make([]AppendEntriesArgs, rf.severNum)
 	AppendLogReply := make([]AppendEntriesReply, rf.severNum)
 	count := 1
-	GRCount := 1
+	GRCount := 0
 	for i := 0; i < rf.severNum; i++ {
-		if i != rf.me {
+		if i != rf.me && rf.isConnected[i] {
+			GRCount++
 			go func(i int) {
 				defer func() {
-					GRCount++
+					rf.mu.Lock()
+					rf.AppendLock[i] = false
+					rf.mu.Unlock()
+					GRCount--
 				}()
+				for rf.AppendLock[i] {
+					time.Sleep(1 * time.Millisecond)
+				}
+				rf.mu.Lock()
+				rf.AppendLock[i] = true
+				rf.mu.Unlock()
 				for {
 					AppendLogArgs[i].LeaderId = rf.me
 					AppendLogArgs[i].LeaderCommit = rf.commitIndex
 					AppendLogArgs[i].Term = rf.currentTerm
-					AppendLogArgs[i].Entries = rf.log[rf.nextIndex[i]]
+					entriesLen := rf.lastLogIndex - rf.nextIndex[i] + 1
+					if entriesLen < 0 {
+						fmt.Println("error")
+					}
+					entries := make([]Entry, entriesLen)
+					for j := 0; j < entriesLen; j++ {
+						entries[j] = rf.log[rf.nextIndex[i]+j]
+					}
+					AppendLogArgs[i].Entries = entries
 					AppendLogArgs[i].PrevLogIndex = rf.nextIndex[i] - 1
 					AppendLogArgs[i].PrevLogItem = rf.log[rf.nextIndex[i]-1].Item
 					// fmt.Printf("节点%d向节点%d复制日志，日志内容为%d\n", rf.me, i, AppendLogArgs[i].Entries.Command)
 					ok := rf.sendAppendEntries(i, &AppendLogArgs[i], &AppendLogReply[i])
 					if ok {
+						rf.isConnected[i] = true
 						if AppendLogReply[i].Success {
-							rf.matchIndex[i] = rf.nextIndex[i]
-							rf.nextIndex[i] = rf.nextIndex[i] + 1
+							rf.nextIndex[i] = rf.lastLogIndex + 1
+							rf.matchIndex[i] = rf.nextIndex[i] - 1
 							if rf.nextIndex[i] == rf.lastLogIndex+1 {
 								rf.mu.Lock()
 								count++
@@ -417,12 +450,24 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 							rf.nextIndex[i]--
 						}
 					} else {
+						rf.isConnected[i] = false
 						return
 					}
 				}
 			}(i)
 		}
 	}
+	// go func() {
+	// 	for {
+	// 		if GRCount == 0 {
+	// 			rf.mu.Lock()
+	// 			rf.AppendLock = false
+	// 			rf.mu.Unlock()
+	// 			return
+	// 		}
+	// 		time.Sleep(1 * time.Millisecond)
+	// 	}
+	// }()
 	for {
 		if count >= (rf.severNum/2 + 1) {
 			for rf.commitIndex < rf.lastLogIndex {
@@ -440,11 +485,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			}
 			return index, term, isLeader
 		}
-		if GRCount == rf.severNum {
+		if GRCount == 0 {
 			return index, term, isLeader
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+
+	// return index, term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -532,10 +579,7 @@ func (rf *Raft) Heartsbeats() {
 			PrevLogIndex: rf.lastLogIndex,
 			PrevLogItem:  rf.lastLogItem,
 			LeaderCommit: rf.commitIndex,
-			Entries: Entry{
-				Command: nil,
-				Item:    0,
-			}}
+			Entries:      make([]Entry, 0)}
 		if i != rf.me {
 			go func(i int) {
 				ok := rf.sendAppendEntries(i, &heatsbeatssArgs[i], &heartsbeatsReply[i])
@@ -551,17 +595,24 @@ func (rf *Raft) Heartsbeats() {
 				} else {
 					rf.isConnected[i] = false
 				}
-				if rf.nextIndex[i] <= rf.lastLogIndex && rf.isConnected[i] && !rf.isAppending && rf.state == leader {
-					for {
+				if rf.nextIndex[i] <= rf.lastLogIndex && rf.state == leader && rf.isConnected[i] && rf.isAppending == 0 {
+					rf.MissLogConut[i]++
+					for rf.MissLogConut[i] >= 10 {
 						heatsbeatssArgs[i].PrevLogIndex = rf.nextIndex[i] - 1
 						heatsbeatssArgs[i].PrevLogItem = rf.log[rf.nextIndex[i]-1].Item
-						heatsbeatssArgs[i].Entries = rf.log[rf.nextIndex[i]]
+						entriesLen := rf.lastLogIndex - rf.nextIndex[i] + 1
+						entries := make([]Entry, entriesLen)
+						for j := 0; j < entriesLen; j++ {
+							entries[j] = rf.log[rf.nextIndex[i]+j]
+						}
+						heatsbeatssArgs[i].Entries = entries
 						ok := rf.sendAppendEntries(i, &heatsbeatssArgs[i], &heartsbeatsReply[i])
 						if ok {
 							if heartsbeatsReply[i].Success {
-								rf.matchIndex[i] = rf.nextIndex[i]
-								rf.nextIndex[i] += 1
+								rf.nextIndex[i] += len(entries)
+								rf.matchIndex[i] = rf.nextIndex[i] - 1
 								if (rf.nextIndex[i] - 1) == rf.lastLogIndex {
+									rf.MissLogConut[i] = 0
 									return
 								}
 							} else {
@@ -572,7 +623,10 @@ func (rf *Raft) Heartsbeats() {
 							rf.isConnected[i] = false
 						}
 					}
+				} else {
+					rf.MissLogConut[i] = 0
 				}
+
 			}(i)
 		}
 	}
@@ -623,6 +677,8 @@ func (rf *Raft) LeaderInit() {
 		rf.nextIndex = append(rf.nextIndex, rf.lastLogIndex+1)
 		rf.matchIndex = append(rf.matchIndex, 0)
 		rf.isConnected[i] = true
+		rf.MissLogConut[i] = 0
+		rf.AppendLock[i] = false
 	}
 	fmt.Printf("节点%d成为领导者节点\n", rf.me)
 }
@@ -658,7 +714,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastLogIndex = 0
 	rf.lastLogItem = 0
 	rf.isConnected = make([]bool, rf.severNum)
-	rf.isAppending = false
+	rf.isAppending = 0
+	rf.AppendLock = make([]bool, rf.severNum)
+	rf.MissLogConut = make([]int, rf.severNum)
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
