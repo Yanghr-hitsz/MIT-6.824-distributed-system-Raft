@@ -19,6 +19,7 @@ package raft
 
 import (
 	"bytes"
+	"sort"
 
 	"fmt"
 	"math/rand"
@@ -78,14 +79,13 @@ type Raft struct {
 	voteFor                  int
 	electionTimeOut          bool
 	restartElectionTimerFlag bool
+	voted                    []bool
 	commitIndex              int
 	nextIndex                []int
 	matchIndex               []int
 	isConnected              []bool
 	log                      []Entry
-	isAppending              int
 	AppendLock               []bool
-	MissLogConut             []int
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -187,11 +187,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.persist()
 	}()
 	// Your code here (2A, 2B).
+	// fmt.Printf("节点%d向%d请求投票\n", args.CandidateId, rf.me)
+	// fmt.Printf("节点%d向%d发起请求,候选者节点的lastItem为%d，lastIndex为%d,节点的lastItem为%d，lastIndex为%d\n", args.CandidateId, rf.me, args.LastLogItem, args.LastLogIndex, rf.lastLogItem, rf.lastLogIndex)
 	if args.Term > rf.currentTerm {
 		rf.mu.Lock()
 		rf.state = follower
-		rf.restartElectionTimerFlag = true
-		rf.electionTimeOut = false
 		rf.currentTerm = args.Term
 		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
@@ -205,6 +205,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.currentTerm
 			return
 		}
+		// fmt.Printf("节点%d投票给%d,候选者节点的lastItem为%d，lastIndex为%d\n", rf.me, args.CandidateId, args.LastLogItem, args.LastLogIndex)
 		reply.VoteGranted = true
 		rf.voteFor = args.CandidateId
 	} else {
@@ -238,9 +239,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	rf.mu.Lock()
-	rf.restartElectionTimerFlag = true
 	rf.state = follower
+	rf.restartElectionTimerFlag = true
 	rf.currentTerm = args.Term
+	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
 	if rf.lastLogIndex < args.PrevLogIndex {
 		reply.Success = false
@@ -249,18 +251,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	if rf.log[args.PrevLogIndex].Item != args.PrevLogItem {
 		rf.lastLogIndex = args.PrevLogIndex - 1
+		if rf.lastLogItem > rf.log[args.PrevLogIndex-1].Item {
+			fmt.Printf("append error1\n")
+		}
 		rf.lastLogItem = rf.log[args.PrevLogIndex-1].Item
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
 	for i := 0; i < len(args.Entries); i++ {
-		rf.lastLogIndex = args.Entries[i].Index
-		rf.lastLogItem = args.Entries[i].Item
-		if rf.lastLogIndex == len(rf.log) {
+		if args.Entries[i].Index == len(rf.log) {
 			rf.log = append(rf.log, args.Entries[i])
 		} else {
-			rf.log[rf.lastLogIndex] = args.Entries[i]
+			rf.log[args.Entries[i].Index] = args.Entries[i]
+		}
+	}
+	EntriesLen := len(args.Entries)
+	if EntriesLen > 0 {
+		if rf.lastLogItem > args.Entries[EntriesLen-1].Item {
+			fmt.Printf("append error2\n")
+		}
+		rf.lastLogIndex = args.Entries[EntriesLen-1].Index
+		rf.lastLogItem = args.Entries[EntriesLen-1].Item
+	}
+	if len(rf.log) >= 3 {
+		if rf.log[1].Command == rf.log[2].Command {
+			fmt.Println("append error")
 		}
 	}
 	if args.LeaderCommit > rf.commitIndex {
@@ -280,8 +296,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	reply.Term = rf.currentTerm
 	// fmt.Printf("节点%d成功复制日志%d,日志内容是%d\n", rf.me, rf.lastLogIndex, args.Entries.Command)
-	return
-
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -335,30 +349,20 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-
-	defer func() {
-		rf.isAppending--
-	}()
-
 	index := rf.lastLogIndex + 1
 	term := rf.currentTerm
 	isLeader := false
 	if rf.state == leader {
 		isLeader = true
 	} else {
-		rf.isAppending++
 		return index, term, isLeader
 	}
 	// Your code here (2B).
-
-	// for rf.AppendLock {
-	// 	time.Sleep(1 * time.Millisecond)
-	// }
-
 	rf.mu.Lock()
-	rf.isAppending++
 	rf.lastLogIndex += 1
 	rf.lastLogItem = rf.currentTerm
+	rf.matchIndex[rf.me] = rf.lastLogIndex
+	rf.nextIndex[rf.me] = rf.lastLogIndex + 1
 	entry := Entry{
 		Command: command,
 		Item:    rf.currentTerm,
@@ -367,131 +371,93 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, entry)
 	index = entry.Index
 	term = entry.Item
+	// fmt.Printf("节点%d添加日志%v\n", rf.me, entry)
 	rf.mu.Unlock()
+	return index, term, isLeader
+}
 
-	time.Sleep(5 * time.Millisecond)
-
-	if entry.Index < rf.lastLogIndex {
-		return index, term, isLeader
-	}
-	if rf.state != leader {
-		isLeader = false
-		return index, term, isLeader
-	}
-	ConnectConut := 0
-	for i := 0; i < rf.severNum; i++ {
-		if rf.isConnected[i] {
-			ConnectConut++
-		}
-	}
-	if ConnectConut < (rf.severNum/2 + 1) {
-		return index, term, isLeader
-	}
-
-	// rf.mu.Lock()
-	// rf.AppendLock = true
-	// rf.mu.Unlock()
-	AppendLogArgs := make([]AppendEntriesArgs, rf.severNum)
-	AppendLogReply := make([]AppendEntriesReply, rf.severNum)
-	count := 1
-	GRCount := 0
-	for i := 0; i < rf.severNum; i++ {
-		if i != rf.me && rf.isConnected[i] {
-			GRCount++
-			go func(i int) {
-				defer func() {
-					rf.mu.Lock()
-					rf.AppendLock[i] = false
-					rf.mu.Unlock()
-					GRCount--
-				}()
-				for rf.AppendLock[i] {
-					time.Sleep(1 * time.Millisecond)
-				}
-				rf.mu.Lock()
-				rf.AppendLock[i] = true
-				rf.mu.Unlock()
-				for {
-					AppendLogArgs[i].LeaderId = rf.me
-					AppendLogArgs[i].LeaderCommit = rf.commitIndex
-					AppendLogArgs[i].Term = rf.currentTerm
-					entriesLen := rf.lastLogIndex - rf.nextIndex[i] + 1
-					if entriesLen < 0 {
-						fmt.Println("error")
-					}
-					entries := make([]Entry, entriesLen)
-					for j := 0; j < entriesLen; j++ {
-						entries[j] = rf.log[rf.nextIndex[i]+j]
-					}
-					AppendLogArgs[i].Entries = entries
-					AppendLogArgs[i].PrevLogIndex = rf.nextIndex[i] - 1
-					AppendLogArgs[i].PrevLogItem = rf.log[rf.nextIndex[i]-1].Item
-					// fmt.Printf("节点%d向节点%d复制日志，日志内容为%d\n", rf.me, i, AppendLogArgs[i].Entries.Command)
-					ok := rf.sendAppendEntries(i, &AppendLogArgs[i], &AppendLogReply[i])
-					if ok {
-						rf.isConnected[i] = true
-						if AppendLogReply[i].Success {
-							rf.nextIndex[i] = rf.lastLogIndex + 1
-							rf.matchIndex[i] = rf.nextIndex[i] - 1
-							if rf.nextIndex[i] == rf.lastLogIndex+1 {
-								rf.mu.Lock()
-								count++
-								rf.mu.Unlock()
-								return
-							}
-						} else {
-							if AppendLogReply[i].Term > rf.currentTerm {
-								rf.mu.Lock()
-								rf.state = follower
-								rf.currentTerm = AppendLogReply[i].Term
-								rf.mu.Unlock()
-								return
-							}
-							rf.nextIndex[i]--
-						}
-					} else {
-						rf.isConnected[i] = false
-						return
-					}
-				}
-			}(i)
-		}
-	}
-	// go func() {
-	// 	for {
-	// 		if GRCount == 0 {
-	// 			rf.mu.Lock()
-	// 			rf.AppendLock = false
-	// 			rf.mu.Unlock()
-	// 			return
-	// 		}
-	// 		time.Sleep(1 * time.Millisecond)
-	// 	}
-	// }()
+func (rf *Raft) AppendLog(i int) {
+	AppendLogArgs := AppendEntriesArgs{}
+	AppendLogReply := AppendEntriesReply{}
 	for {
-		if count >= (rf.severNum/2 + 1) {
-			for rf.commitIndex < rf.lastLogIndex {
-				rf.commitIndex++
-				rf.applyMsg <- ApplyMsg{
-					CommandValid:  true,
-					Command:       rf.log[rf.commitIndex].Command,
-					CommandIndex:  rf.commitIndex,
-					SnapshotValid: false,
-					Snapshot:      []byte{},
-					SnapshotTerm:  0,
-					SnapshotIndex: 0,
+		rf.mu.Lock()
+		AppendLogArgs.LeaderId = rf.me
+		AppendLogArgs.LeaderCommit = rf.commitIndex
+		AppendLogArgs.Term = rf.currentTerm
+		entriesLen := rf.lastLogIndex - rf.nextIndex[i] + 1
+		AppendLogArgs.PrevLogIndex = rf.nextIndex[i] - 1
+		AppendLogArgs.PrevLogItem = rf.log[rf.nextIndex[i]-1].Item
+		rf.mu.Unlock()
+		if entriesLen == 0 {
+			return
+		}
+		if entriesLen < 0 {
+			fmt.Println("Appendlog error")
+		}
+		entries := make([]Entry, entriesLen)
+		for j := 0; j < entriesLen; j++ {
+			entries[j] = rf.log[rf.nextIndex[i]+j]
+		}
+		AppendLogArgs.Entries = entries
+		// fmt.Printf("节点%d向节点%d复制日志，日志内容为%v\n", rf.me, i, AppendLogArgs.Entries)
+		ok := rf.sendAppendEntries(i, &AppendLogArgs, &AppendLogReply)
+		if ok {
+			rf.isConnected[i] = true
+			if AppendLogReply.Success {
+				rf.nextIndex[i] += len(AppendLogArgs.Entries)
+				rf.matchIndex[i] = rf.nextIndex[i] - 1
+				if rf.nextIndex[i] == rf.lastLogIndex+1 {
+					return
 				}
-				// fmt.Printf("日志%d已经提交\n", rf.commitIndex)
+			} else {
+				if AppendLogReply.Term > rf.currentTerm {
+					rf.mu.Lock()
+					rf.state = follower
+					rf.restartElectionTimerFlag = true
+					rf.electionTimeOut = false
+					rf.currentTerm = AppendLogReply.Term
+					rf.mu.Unlock()
+					return
+				}
+				rf.nextIndex[i]--
 			}
-			return index, term, isLeader
+		} else {
+			rf.isConnected[i] = false
+			return
 		}
-		if GRCount == 0 {
-			return index, term, isLeader
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
-
-	// return index, term, isLeader
+}
+func (rf *Raft) CheckLog(i int) {
+	for rf.state == leader {
+		if rf.lastLogIndex > rf.matchIndex[i] && rf.isConnected[i] {
+			rf.AppendLog(i)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+func (rf *Raft) CommitLog() {
+	for rf.state == leader {
+		matchIndex := make([]int, rf.severNum)
+		for i := 0; i < rf.severNum; i++ {
+			matchIndex[i] = rf.matchIndex[i]
+		}
+		sort.Ints(matchIndex)
+		commitIndex := matchIndex[rf.severNum/2]
+		for rf.commitIndex < commitIndex && commitIndex > 0 {
+			rf.commitIndex++
+			// fmt.Printf("日志%d以提交\n", rf.commitIndex)
+			rf.applyMsg <- ApplyMsg{
+				CommandValid:  true,
+				Command:       rf.log[rf.commitIndex].Command,
+				CommandIndex:  rf.commitIndex,
+				SnapshotValid: false,
+				Snapshot:      []byte{},
+				SnapshotTerm:  0,
+				SnapshotIndex: 0,
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -530,23 +496,14 @@ func (rf *Raft) ticker() {
 				rf.ElectionTimer()
 			}
 			if rf.electionTimeOut {
-				rf.electionTimeOut = false
 				rf.mu.Lock()
+				rf.electionTimeOut = false
 				rf.state = candidate
-				rf.currentTerm = rf.currentTerm + 1
 				rf.mu.Unlock()
 			}
 		}
 		if rf.state == candidate {
 			rf.Election()
-			if rf.state != leader {
-				rand.Seed(time.Now().UnixNano() * int64(rf.me))
-				s := rand.Intn(150) + 150
-				time.Sleep(time.Duration(s) * time.Millisecond)
-			}
-			if rf.state == candidate {
-				rf.currentTerm = rf.currentTerm + 1
-			}
 		}
 
 	}
@@ -570,6 +527,17 @@ func (rf *Raft) HeartsbeatsTimer() {
 	time.Sleep(50 * time.Millisecond)
 }
 func (rf *Raft) Heartsbeats() {
+	// ConnectCount := 0
+	// for j := 0; j < rf.severNum; j++ {
+	// 	if rf.isConnected[j] {
+	// 		ConnectCount++
+	// 	}
+	// }
+	// if ConnectCount < (rf.severNum/2 + 1) {
+	// 	rf.state = follower
+	// 	rf.electionTimeOut = false
+	// 	rf.restartElectionTimerFlag = true
+	// }
 	heatsbeatssArgs := make([]AppendEntriesArgs, rf.severNum)
 	heartsbeatsReply := make([]AppendEntriesReply, rf.severNum)
 	for i := 0; i < rf.severNum; i++ {
@@ -587,6 +555,8 @@ func (rf *Raft) Heartsbeats() {
 					if heartsbeatsReply[i].Term > rf.currentTerm {
 						rf.mu.Lock()
 						rf.state = follower
+						rf.restartElectionTimerFlag = true
+						rf.electionTimeOut = false
 						rf.currentTerm = heartsbeatsReply[i].Term
 						rf.mu.Unlock()
 						return
@@ -595,91 +565,83 @@ func (rf *Raft) Heartsbeats() {
 				} else {
 					rf.isConnected[i] = false
 				}
-				if rf.nextIndex[i] <= rf.lastLogIndex && rf.state == leader && rf.isConnected[i] && rf.isAppending == 0 {
-					rf.MissLogConut[i]++
-					for rf.MissLogConut[i] >= 10 {
-						heatsbeatssArgs[i].PrevLogIndex = rf.nextIndex[i] - 1
-						heatsbeatssArgs[i].PrevLogItem = rf.log[rf.nextIndex[i]-1].Item
-						entriesLen := rf.lastLogIndex - rf.nextIndex[i] + 1
-						entries := make([]Entry, entriesLen)
-						for j := 0; j < entriesLen; j++ {
-							entries[j] = rf.log[rf.nextIndex[i]+j]
-						}
-						heatsbeatssArgs[i].Entries = entries
-						ok := rf.sendAppendEntries(i, &heatsbeatssArgs[i], &heartsbeatsReply[i])
-						if ok {
-							if heartsbeatsReply[i].Success {
-								rf.nextIndex[i] += len(entries)
-								rf.matchIndex[i] = rf.nextIndex[i] - 1
-								if (rf.nextIndex[i] - 1) == rf.lastLogIndex {
-									rf.MissLogConut[i] = 0
-									return
-								}
-							} else {
-								rf.nextIndex[i]--
-							}
-							rf.isConnected[i] = true
-						} else {
-							rf.isConnected[i] = false
-						}
-					}
-				} else {
-					rf.MissLogConut[i] = 0
-				}
-
 			}(i)
 		}
 	}
 }
 func (rf *Raft) Election() {
-	// fmt.Printf("节点%d开始选举\n", rf.me)
-	reqArgs := make([]RequestVoteArgs, 0)
-	reqReply := make([]RequestVoteReply, 0)
-	voteNum := 1
+	fmt.Printf("节点%d开始选举,任期为%d,在%v\n", rf.me, rf.currentTerm, time.Now())
+	rf.currentTerm = rf.currentTerm + 1
+	reqArgs := make([]RequestVoteArgs, rf.severNum)
+	reqReply := make([]RequestVoteReply, rf.severNum)
+	rf.voted = make([]bool, rf.severNum)
 	rf.voteFor = rf.me
-	GRCount := 0
+	voteNum := 1
 	for i := 0; i < rf.severNum; i++ {
-		reqArgs = append(reqArgs, RequestVoteArgs{
+		rf.voted[i] = false
+		reqArgs[i] = RequestVoteArgs{
 			Term:         rf.currentTerm,
 			CandidateId:  rf.me,
 			LastLogIndex: rf.lastLogIndex,
-			LastLogItem:  rf.lastLogItem})
-		reqReply = append(reqReply, RequestVoteReply{})
+			LastLogItem:  rf.lastLogItem}
+		reqReply[i] = RequestVoteReply{}
 		if i != rf.me {
 			go func(i int) {
-				rf.sendRequestVote(i, &reqArgs[i], &reqReply[i])
-				if reqReply[i].VoteGranted {
-					rf.mu.Lock()
-					voteNum++
-					if voteNum >= (rf.severNum/2 + 1) {
-						rf.state = leader
+				ok := rf.sendRequestVote(i, &reqArgs[i], &reqReply[i])
+				if ok {
+					if reqReply[i].VoteGranted {
+						rf.mu.Lock()
+						rf.voted[i] = true
+						rf.mu.Unlock()
 					}
-					rf.mu.Unlock()
+					if reqReply[i].Term > rf.currentTerm {
+						rf.state = follower
+						rf.restartElectionTimerFlag = true
+						rf.electionTimeOut = false
+						rf.currentTerm = reqReply[i].Term
+					}
 				}
-				GRCount++
 			}(i)
 		}
 	}
-	for {
-		if GRCount == rf.severNum-1 {
-			return
+	rand.Seed(time.Now().UnixNano() * int64(rf.me))
+	s := rand.Intn(150) + 150
+	for j := 0; j < s; j++ {
+		time.Sleep(time.Millisecond)
+		voteNum = 1
+		for k := 0; k < rf.severNum; k++ {
+			if rf.voted[k] {
+				voteNum++
+			}
+		}
+		if voteNum >= (rf.severNum/2 + 1) {
+			rf.state = leader
 		}
 		if rf.state != candidate {
 			if rf.state == leader {
 				rf.LeaderInit()
+				return
 			}
-			return
 		}
+	}
+	if rf.state == follower {
+		return
 	}
 }
 func (rf *Raft) LeaderInit() {
+	rf.nextIndex = make([]int, rf.severNum)
+	rf.matchIndex = make([]int, rf.severNum)
 	for i := 0; i < rf.severNum; i++ {
-		rf.nextIndex = append(rf.nextIndex, rf.lastLogIndex+1)
-		rf.matchIndex = append(rf.matchIndex, 0)
+		rf.nextIndex[i] = rf.lastLogIndex + 1
+		rf.matchIndex[i] = 0
 		rf.isConnected[i] = true
-		rf.MissLogConut[i] = 0
 		rf.AppendLock[i] = false
+		if rf.me != i {
+			go rf.CheckLog(i)
+		}
 	}
+	go rf.CommitLog()
+
 	fmt.Printf("节点%d成为领导者节点\n", rf.me)
 }
 
@@ -714,9 +676,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastLogIndex = 0
 	rf.lastLogItem = 0
 	rf.isConnected = make([]bool, rf.severNum)
-	rf.isAppending = 0
 	rf.AppendLock = make([]bool, rf.severNum)
-	rf.MissLogConut = make([]int, rf.severNum)
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
@@ -724,7 +684,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.lastLogIndex = len(rf.log) - 1
 	rf.lastLogItem = rf.log[rf.lastLogIndex].Item
-
 	// start ticker goroutine to start elections
 	go rf.ticker()
 

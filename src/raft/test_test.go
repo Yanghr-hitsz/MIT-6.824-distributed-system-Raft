@@ -374,7 +374,6 @@ loop:
 			// leader moved on really quickly
 			continue
 		}
-
 		iters := 5
 		var wg sync.WaitGroup
 		is := make(chan int, iters)
@@ -524,7 +523,7 @@ func TestBackup2B(t *testing.T) {
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
-		cfg.one(rand.Int(), 3, true)
+		cfg.one(i, 3, true)
 	}
 
 	// now another partitioned leader and one follower
@@ -551,7 +550,7 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect(other)
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
-		cfg.one(rand.Int(), 3, true)
+		cfg.one(i+50, 3, true)
 	}
 	// now everyone
 	for i := 0; i < servers; i++ {
@@ -930,7 +929,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 				nup += 1
 			}
 		}
-		fmt.Println(iters)
+		// fmt.Println(iters)
 	}
 
 	for i := 0; i < servers; i++ {
@@ -938,7 +937,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 			cfg.connect(i)
 		}
 	}
-
+	time.Sleep(10 * time.Second)
 	cfg.one(rand.Int()%10000, servers, true)
 
 	cfg.end()
