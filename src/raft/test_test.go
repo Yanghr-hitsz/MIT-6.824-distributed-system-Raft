@@ -138,7 +138,6 @@ func TestBasicAgree2B(t *testing.T) {
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")
 		}
-
 		xindex := cfg.one(index*100, servers, false)
 		if xindex != index {
 			t.Fatalf("got index %v but expected %v", xindex, index)
@@ -874,7 +873,6 @@ func TestUnreliableAgree2C(t *testing.T) {
 			}(iters, j)
 		}
 		cfg.one(iters, 1, true)
-		fmt.Println(iters)
 	}
 
 	cfg.setunreliable(false)
@@ -894,7 +892,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 	cfg.begin("Test (2C): Figure 8 (unreliable)")
 
 	cfg.one(rand.Int()%10000, 1, true)
-
+	index := 0
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
 		if iters == 200 {
@@ -903,12 +901,12 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		leader := -1
 		for i := 0; i < servers; i++ {
 			// _, _, ok := cfg.rafts[i].Start(rand.Int() % 10000)
-			_, _, ok := cfg.rafts[i].Start(iters*1000 + i)
+			_, _, ok := cfg.rafts[i].Start(index)
 			if ok && cfg.connected[i] {
 				leader = i
 			}
 		}
-
+		index++
 		if (rand.Int() % 1000) < 100 {
 			ms := rand.Int63() % (int64(RaftElectionTimeout/time.Millisecond) / 2)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
@@ -918,6 +916,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 		}
 
 		if leader != -1 && (rand.Int()%1000) < int(RaftElectionTimeout/time.Millisecond)/2 {
+			cfg.rafts[leader].debug.Debug(" 断开链接", cfg.rafts[leader].debug.LogFlag, dHeart)
 			cfg.disconnect(leader)
 			nup -= 1
 		}
@@ -929,7 +928,6 @@ func TestFigure8Unreliable2C(t *testing.T) {
 				nup += 1
 			}
 		}
-		// fmt.Println(iters)
 	}
 
 	for i := 0; i < servers; i++ {
@@ -937,7 +935,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 			cfg.connect(i)
 		}
 	}
-	time.Sleep(10 * time.Second)
+	// time.Sleep(5 * time.Second)
 	cfg.one(rand.Int()%10000, servers, true)
 
 	cfg.end()
