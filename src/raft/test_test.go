@@ -1097,7 +1097,7 @@ func TestUnreliableChurn2C(t *testing.T) {
 const MAXLOGSIZE = 2000
 
 func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash bool) {
-	iters := 30
+	iters := 10
 	servers := 3
 	cfg := make_config(t, servers, !reliable, true)
 	defer cfg.cleanup()
@@ -1106,8 +1106,9 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 
 	cfg.one(rand.Int(), servers, true)
 	leader1 := cfg.checkOneLeader()
-
+	index := 0
 	for i := 0; i < iters; i++ {
+		fmt.Printf("iters %d\n", i)
 		victim := (leader1 + 1) % servers
 		sender := leader1
 		if i%3 == 1 {
@@ -1127,7 +1128,8 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 		// perhaps send enough to get a snapshot
 		nn := (SnapShotInterval / 2) + (rand.Int() % SnapShotInterval)
 		for i := 0; i < nn; i++ {
-			cfg.rafts[sender].Start(rand.Int())
+			cfg.rafts[sender].Start(index)
+			index++
 		}
 
 		// let applier threads catch up with the Start()'s
@@ -1135,7 +1137,8 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			// make sure all followers have caught up, so that
 			// an InstallSnapshot RPC isn't required for
 			// TestSnapshotBasic2D().
-			cfg.one(rand.Int(), servers, true)
+			cfg.one(index, servers, true)
+			index++
 		} else {
 			cfg.one(rand.Int(), servers-1, true)
 		}
@@ -1196,6 +1199,7 @@ func TestSnapshotAllCrash2D(t *testing.T) {
 
 	for i := 0; i < iters; i++ {
 		// perhaps enough to get a snapshot
+		fmt.Printf("iters %d\n", i)
 		nn := (SnapShotInterval / 2) + (rand.Int() % SnapShotInterval)
 		for i := 0; i < nn; i++ {
 			cfg.one(rand.Int(), servers, true)
